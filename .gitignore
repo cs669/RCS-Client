@@ -1,0 +1,30 @@
+# Gradle / build output
+.gradle/
+build/
+**/build/
+.kotlin/
+.externalNativeBuild/
+.cxx/
+captures/
+
+# Local machine config (SDK path)
+local.properties
+
+# IDE
+.idea/
+*.iml
+
+# Signing keys and secrets
+*.jks
+*.keystore
+keystore.properties
+google-services.json
+.env
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Local backups and leftovers, kept on disk only
+_removed_in_step1/
+*.tgz
