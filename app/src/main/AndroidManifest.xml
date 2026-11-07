@@ -82,6 +82,16 @@
             </intent-filter>
         </receiver>
 
+        <!-- MMS send and download results. Manifest receivers so the result still arrives
+             if Android closed the app while the carrier was working on it. Not exported:
+             only our own PendingIntents (sent by the phone process on our behalf) reach them. -->
+        <receiver
+            android:name=".telephony.MmsSentReceiver"
+            android:exported="false" />
+        <receiver
+            android:name=".telephony.MmsDownloadedReceiver"
+            android:exported="false" />
+
         <!-- 4. Service for quick reply / Respond Via Message (Required for ROLE_SMS) -->
         <service
             android:name=".telephony.HeadlessSmsSendService"
@@ -96,6 +106,17 @@
                 <data android:scheme="mmsto" />
             </intent-filter>
         </service>
+
+        <!-- 5. FileProvider for SmsManager.sendMultimediaMessage & downloadMultimediaMessage PDUs -->
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="${applicationId}.mmsprovider"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/mms_file_paths" />
+        </provider>
 
     </application>
 

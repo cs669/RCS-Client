@@ -139,7 +139,9 @@ data class RcsMessage(
     val richCards: List<RichCard> = emptyList(),
     val suggestedChips: List<SuggestedChip> = emptyList(),
     val reactions: List<MessageReaction> = emptyList(),
-    val mlsEnvelope: MlsEnvelope? = null
+    val mlsEnvelope: MlsEnvelope? = null,
+    /** Where this message lives in Android's shared SMS/MMS storage, once it's been saved there. */
+    val systemUri: String? = null
 )
 
 data class RcsConversation(

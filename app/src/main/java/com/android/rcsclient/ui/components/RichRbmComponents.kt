@@ -1,7 +1,10 @@
 package com.android.rcsclient.ui.components
 
+import android.graphics.BitmapFactory
+import android.net.Uri
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.horizontalScroll
@@ -11,6 +14,7 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
@@ -65,6 +69,9 @@ import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
@@ -75,6 +82,7 @@ import com.android.rcsclient.model.MediaAttachment
 import com.android.rcsclient.model.RichCard
 import com.android.rcsclient.model.SuggestedChip
 import com.android.rcsclient.model.SuggestionType
+import java.io.File
 import kotlinx.coroutines.delay
 
 /**
@@ -271,6 +279,20 @@ private fun HighResPhotoAttachmentCard(
     onActionClick: (String) -> Unit,
     modifier: Modifier = Modifier
 ) {
+    val context = LocalContext.current
+    val loadedBitmap = remember(attachment.uriString) {
+        val uriStr = attachment.uriString
+        if (!uriStr.isNullOrBlank()) {
+            runCatching {
+                val uri = Uri.parse(uriStr)
+                when (uri.scheme) {
+                    "file" -> uri.path?.let { BitmapFactory.decodeFile(File(it).absolutePath) }
+                    else -> context.contentResolver.openInputStream(uri)?.use { BitmapFactory.decodeStream(it) }
+                }
+            }.getOrNull()
+        } else null
+    }
+
     val palettes = listOf(
         listOf(Color(0xFF0F2027), Color(0xFF203A43), Color(0xFF2C5364)),
         listOf(Color(0xFF1A2980), Color(0xFF26D0CE)),
@@ -283,28 +305,37 @@ private fun HighResPhotoAttachmentCard(
     Card(
         modifier = modifier
             .fillMaxWidth()
-            .clickable { onActionClick("Viewing full-resolution FT-HTTP asset: ${attachment.title}") },
+            .clickable { onActionClick("Attachment: ${attachment.title}") },
         shape = RoundedCornerShape(14.dp),
         elevation = CardDefaults.cardElevation(defaultElevation = 1.dp)
     ) {
         Box(
             modifier = Modifier
                 .fillMaxWidth()
-                .height(155.dp)
+                .height(185.dp)
                 .background(Brush.linearGradient(chosenGradient))
         ) {
-            // Subtle horizon & sun illustration in Canvas
-            Canvas(modifier = Modifier.matchParentSize()) {
-                drawCircle(
-                    color = Color.White.copy(alpha = 0.22f),
-                    radius = size.minDimension * 0.22f,
-                    center = Offset(size.width * 0.78f, size.height * 0.32f)
+            if (loadedBitmap != null) {
+                Image(
+                    bitmap = loadedBitmap.asImageBitmap(),
+                    contentDescription = attachment.title,
+                    contentScale = ContentScale.Crop,
+                    modifier = Modifier.fillMaxSize()
                 )
-                drawCircle(
-                    color = Color.White.copy(alpha = 0.1f),
-                    radius = size.minDimension * 0.35f,
-                    center = Offset(size.width * 0.78f, size.height * 0.32f)
-                )
+            } else {
+                // Subtle horizon & sun illustration in Canvas when no bitmap file is present
+                Canvas(modifier = Modifier.matchParentSize()) {
+                    drawCircle(
+                        color = Color.White.copy(alpha = 0.22f),
+                        radius = size.minDimension * 0.22f,
+                        center = Offset(size.width * 0.78f, size.height * 0.32f)
+                    )
+                    drawCircle(
+                        color = Color.White.copy(alpha = 0.1f),
+                        radius = size.minDimension * 0.35f,
+                        center = Offset(size.width * 0.78f, size.height * 0.32f)
+                    )
+                }
             }
 
             Surface(
@@ -326,7 +357,7 @@ private fun HighResPhotoAttachmentCard(
                     )
                     Spacer(modifier = Modifier.width(4.dp))
                     Text(
-                        text = "ORIGINAL QUALITY • FT-HTTP",
+                        text = if (loadedBitmap != null) "MMS PHOTO" else "MEDIA ATTACHMENT",
                         color = Color.White,
                         fontSize = 10.sp,
                         fontWeight = FontWeight.Bold

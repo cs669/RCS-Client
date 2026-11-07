@@ -15,9 +15,17 @@ import com.android.rcsclient.network.PhoneNumbers
 import com.android.rcsclient.network.RcsClientConfig
 import com.android.rcsclient.network.RcsTransport
 import com.android.rcsclient.telephony.CarrierImsRcsManager
+import com.android.rcsclient.telephony.IncomingMms
+import com.android.rcsclient.telephony.SystemMessage
+import com.android.rcsclient.telephony.SystemMessageStore
+import com.android.rcsclient.telephony.SystemThread
+import android.telephony.SubscriptionManager
+import java.util.concurrent.atomic.AtomicBoolean
+import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -34,7 +42,11 @@ class RcsRepository(
     private val dbHelper: RcsDatabaseHelper?,
     val imsRcsManager: CarrierImsRcsManager,
     val rcsTransport: RcsTransport = NotConnectedRcsTransport,
-    private val externalScope: CoroutineScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+    private val externalScope: CoroutineScope = CoroutineScope(SupervisorJob() + Dispatchers.Default),
+    /** Android's shared SMS/MMS storage. Null in unit tests that don't care about it. */
+    private val systemStore: SystemMessageStore? = null,
+    /** One at a time, so a message is always saved before its status update is applied. */
+    private val storeDispatcher: CoroutineDispatcher = Dispatchers.IO.limitedParallelism(1)
 ) {
 
     private val _conversations = MutableStateFlow<List<RcsConversation>>(emptyList())
@@ -46,14 +58,17 @@ class RcsRepository(
     private val _imsStatus = MutableStateFlow(imsRcsManager.queryImsRegistrationStatus(rcsTransport))
     val imsStatus: StateFlow<ImsRegistrationStatus> = _imsStatus.asStateFlow()
 
-    private val _networkConfig = MutableStateFlow(RcsClientConfig())
+    private val _networkConfig = MutableStateFlow(RcsClientConfig(localPhoneNumber = imsRcsManager.loadOwnPhoneNumber()))
     val networkConfig: StateFlow<RcsClientConfig> = _networkConfig.asStateFlow()
 
     private val _lastTransportEvent = MutableStateFlow<String?>(null)
     val lastTransportEvent: StateFlow<String?> = _lastTransportEvent.asStateFlow()
 
+    private val importRunning = AtomicBoolean(false)
+
     init {
         loadPersistedData()
+        importSystemHistoryIfNeeded()
     }
 
     /**
@@ -68,10 +83,19 @@ class RcsRepository(
         _conversations.value = sortConversations(real)
         _messagesByConversation.value = dbHelper?.loadAllMessagesByConversation().orEmpty()
             .filterKeys { it in realIds }
+
+        // Anything still "Sending" from before the app last closed, and older than the MMS timeout,
+        // is never going to finish. Show it as failed instead of leaving it hanging.
+        val cutoff = System.currentTimeMillis() - MMS_SEND_TIMEOUT_MS
+        _messagesByConversation.value.forEach { (convId, msgs) ->
+            msgs.filter { it.deliveryStatus == DeliveryStatus.SENDING && it.timestampMs < cutoff }
+                .forEach { updateMessageStatus(convId, it.id, DeliveryStatus.FAILED) }
+        }
     }
 
     fun updateNetworkConfig(newConfig: RcsClientConfig) {
         _networkConfig.value = newConfig
+        imsRcsManager.saveOwnPhoneNumber(newConfig.localPhoneNumber)
     }
 
     fun loadDeviceContacts() = imsRcsManager.loadDeviceContacts()
@@ -84,6 +108,8 @@ class RcsRepository(
 
     fun refreshImsAndRoleStatus() {
         _imsStatus.value = imsRcsManager.queryImsRegistrationStatus(rcsTransport)
+        // Becoming the default SMS app is what unlocks the shared storage, so check again here.
+        importSystemHistoryIfNeeded()
     }
 
     fun markConversationRead(conversationId: String) {
@@ -100,6 +126,12 @@ class RcsRepository(
             }
         }
         updatedConv?.let { dbHelper?.saveConversation(it) }
+
+        val conv = _conversations.value.find { it.id == conversationId } ?: return
+        val inSystemStore = _messagesByConversation.value[conversationId].orEmpty().any { it.systemUri != null }
+        if (inSystemStore) {
+            withSystemStore { store -> store.markThreadRead(conversationPhones(conv)) }
+        }
     }
 
     fun togglePinConversation(conversationId: String) {
@@ -155,18 +187,23 @@ class RcsRepository(
         val trimmedBody = body.trim()
         if (trimmedBody.isEmpty() && attachments.isEmpty() && richCards.isEmpty()) return null
 
-        val effectiveProtocol = forceProtocol ?: imsRcsManager.selectTransportProtocol(
-            isImsRegistered = rcsTransport.isRegistered,
-            preferredProtocol = conv.preferredProtocol,
-            recipientCapabilities = conv.capabilities,
-            autoSmsFallback = conv.autoSmsFallback,
-            hasMediaAttachments = attachments.isNotEmpty() || richCards.isNotEmpty()
-        )
+        val isGroupThread = conv.participants.size > 1 || conv.conversationType == ConversationType.GROUP_RCS
+        val effectiveProtocol = when {
+            forceProtocol != null -> forceProtocol
+            isGroupThread && !rcsTransport.isRegistered -> TransportProtocol.MMS
+            else -> imsRcsManager.selectTransportProtocol(
+                isImsRegistered = rcsTransport.isRegistered,
+                preferredProtocol = conv.preferredProtocol,
+                recipientCapabilities = conv.capabilities,
+                autoSmsFallback = conv.autoSmsFallback,
+                hasMediaAttachments = attachments.isNotEmpty() || richCards.isNotEmpty()
+            )
+        }
 
         val now = System.currentTimeMillis()
         val effectiveText = when {
             trimmedBody.isNotEmpty() -> trimmedBody
-            attachments.isNotEmpty() -> attachments.first().title
+            attachments.isNotEmpty() -> "📎 ${attachments.first().title}"
             richCards.isNotEmpty() -> richCards.first().title
             else -> ""
         }
@@ -195,13 +232,39 @@ class RcsRepository(
         return outgoingMessage
     }
 
+    /**
+     * Resolves a user-picked `content://` media URI into a persistent `MediaAttachment`
+     * and dispatches it over MMS (or RCS if registered).
+     */
+    fun sendMediaUriMessage(
+        conversationId: String,
+        uriString: String,
+        captionText: String = "",
+        replyToMessage: RcsMessage? = null
+    ): RcsMessage? {
+        val attachment = imsRcsManager.resolveAttachmentFromUri(uriString)
+        if (attachment == null) {
+            _lastTransportEvent.value = "Could not read selected attachment file"
+            return null
+        }
+        return sendMessage(
+            conversationId = conversationId,
+            body = captionText,
+            attachments = listOf(attachment),
+            replyToMessage = replyToMessage
+        )
+    }
+
     private fun dispatch(
         conv: RcsConversation,
         message: RcsMessage,
         effectiveText: String,
         protocol: TransportProtocol
     ) {
-        val recipients = conv.participants.map { it.phoneNumber }.ifEmpty { listOf(conv.subtitleOrPhone) }
+        val ownNumber = _networkConfig.value.localPhoneNumber
+        val recipients = conv.participants.map { it.phoneNumber }
+            .filterNot { ownNumber.isNotBlank() && PhoneNumbers.sameNumber(it, ownNumber) }
+            .ifEmpty { listOf(conv.subtitleOrPhone) }
 
         fun fail(reason: String) {
             updateMessageStatus(conv.id, message.id, DeliveryStatus.FAILED)
@@ -209,21 +272,30 @@ class RcsRepository(
         }
 
         when {
-            recipients.size > 1 || conv.conversationType != ConversationType.ONE_TO_ONE ->
-                fail("Group messages need MMS or RCS group chat, and neither is built yet")
-
             protocol == TransportProtocol.RCS_UP_2_7 -> {
                 if (!rcsTransport.isRegistered) {
-                    fail("RCS isn't connected, and SMS fallback is off for this chat")
+                    if (conv.autoSmsFallback) {
+                        if (message.attachments.isNotEmpty() || recipients.size > 1) {
+                            sendCellularMms(conv.id, message.id, recipients, message.body, message.attachments)
+                        } else {
+                            sendCellularSms(conv.id, message.id, recipients.first(), effectiveText)
+                        }
+                    } else {
+                        fail("RCS isn't connected, and SMS/MMS fallback is off for this chat")
+                    }
                     return
                 }
                 externalScope.launch {
                     rcsTransport.sendChatMessage(PhoneNumbers.normalizeToE164(recipients.first()), message)
                         .onSuccess { updateMessageStatus(conv.id, message.id, DeliveryStatus.SENT) }
                         .onFailure { err ->
-                            if (conv.autoSmsFallback && message.attachments.isEmpty() && message.richCards.isEmpty()) {
-                                _lastTransportEvent.value = "RCS send failed (${err.message}), sending as SMS"
-                                sendCellularSms(conv.id, message.id, recipients.first(), effectiveText)
+                            if (conv.autoSmsFallback) {
+                                _lastTransportEvent.value = "RCS send failed (${err.message}), falling back to SMS/MMS"
+                                if (message.attachments.isNotEmpty() || recipients.size > 1) {
+                                    sendCellularMms(conv.id, message.id, recipients, message.body, message.attachments)
+                                } else {
+                                    sendCellularSms(conv.id, message.id, recipients.first(), effectiveText)
+                                }
                             } else {
                                 fail("RCS send failed: ${err.message}")
                             }
@@ -231,8 +303,9 @@ class RcsRepository(
                 }
             }
 
-            protocol == TransportProtocol.MMS ->
-                fail("Attachments need MMS, which isn't built yet")
+            protocol == TransportProtocol.MMS || recipients.size > 1 || message.attachments.isNotEmpty() -> {
+                sendCellularMms(conv.id, message.id, recipients, message.body, message.attachments)
+            }
 
             else -> sendCellularSms(conv.id, message.id, recipients.first(), effectiveText)
         }
@@ -244,6 +317,12 @@ class RcsRepository(
         destinationPhone: String,
         text: String
     ) {
+        saveOutgoingToSystemStore(conversationId, messageId) { store, msg ->
+            store.insertSms(
+                SystemMessageStore.Box.OUTBOX, destinationPhone, text, msg.timestampMs,
+                read = true, subId = SubscriptionManager.INVALID_SUBSCRIPTION_ID
+            )
+        }
         imsRcsManager.dispatchRealCellularSms(
             messageId = messageId,
             destinationPhone = destinationPhone,
@@ -254,6 +333,45 @@ class RcsRepository(
             }
         )
     }
+
+    private fun sendCellularMms(
+        conversationId: String,
+        messageId: String,
+        recipients: List<String>,
+        bodyText: String,
+        attachments: List<MediaAttachment>
+    ) {
+        saveOutgoingToSystemStore(conversationId, messageId) { store, msg ->
+            store.insertMms(
+                SystemMessageStore.Box.OUTBOX, recipients, null, recipients, bodyText, attachments, msg.timestampMs,
+                read = true, subId = SubscriptionManager.INVALID_SUBSCRIPTION_ID
+            )
+        }
+        val handedOff = imsRcsManager.dispatchRealCellularMms(
+            messageId = messageId,
+            recipients = recipients,
+            bodyText = bodyText,
+            attachments = attachments,
+            onStatusUpdate = { newStatus, infoMessage ->
+                updateMessageStatus(conversationId, messageId, newStatus)
+                _lastTransportEvent.value = infoMessage
+            }
+        )
+        if (handedOff) {
+            // The phone's MMS service sometimes never answers, for example when the SIM has no
+            // MMS APN. Without this the message would say "Sending" forever.
+            externalScope.launch {
+                delay(MMS_SEND_TIMEOUT_MS)
+                if (statusOf(conversationId, messageId) == DeliveryStatus.SENDING) {
+                    updateMessageStatus(conversationId, messageId, DeliveryStatus.FAILED)
+                    _lastTransportEvent.value = MMS_TIMEOUT_TEXT
+                }
+            }
+        }
+    }
+
+    private fun statusOf(conversationId: String, messageId: String): DeliveryStatus? =
+        _messagesByConversation.value[conversationId]?.firstOrNull { it.id == messageId }?.deliveryStatus
 
     /**
      * Toggles an emoji reaction on a message (GSMA UP 2.7 Reaction CPIM header).
@@ -378,6 +496,103 @@ class RcsRepository(
         )
         appendMessageInternal(msg)
         updateConversationPreview(existing.id, body, timestampMs, clearUnread = false)
+        withSystemStore { store ->
+            val uri = store.insertSms(
+                SystemMessageStore.Box.INBOX, senderPhone, body, timestampMs,
+                read = false, subId = SubscriptionManager.INVALID_SUBSCRIPTION_ID
+            )
+            if (uri != null) setSystemUri(existing.id, msg.id, uri)
+        }
+    }
+
+    /**
+     * Handles an incoming binary MMS WAP Push PDU (`M-Notification.ind` or `M-Retrieve.conf`)
+     * from `MmsWapPushDeliverReceiver`, downloading the full carrier MMS via `SmsManager.downloadMultimediaMessage`
+     * and ingesting its text and media attachments.
+     */
+    fun receiveIncomingWapPushMms(wapPushPdu: ByteArray, subId: Int) {
+        imsRcsManager.handleIncomingWapPushMms(wapPushPdu, subId) { mms -> receiveIncomingMms(mms) }
+    }
+
+    /**
+     * Threads a received MMS. Group MMS are recognised from the To and Cc lists: everyone on
+     * the message except us and the sender. If that leaves anyone, it's a group thread made of
+     * the sender plus those people, matched to an existing group with the same members.
+     */
+    fun receiveIncomingMms(mms: IncomingMms) {
+        val senderPhone = mms.sender
+        val ownNumber = _networkConfig.value.localPhoneNumber
+        val others = mms.recipients
+            .filterNot { ownNumber.isNotBlank() && PhoneNumbers.sameNumber(it, ownNumber) }
+            .filterNot { PhoneNumbers.sameNumber(it, senderPhone) }
+            .distinctBy { it.filter { ch -> ch.isDigit() }.removePrefix("1").ifBlank { it.lowercase() } }
+
+        // Without our own number we can't tell which recipient is us. A 1:1 MMS then shows one
+        // "other" recipient (us), so only treat it as a group when there are at least two.
+        val isGroupMms = if (ownNumber.isNotBlank()) others.isNotEmpty() else others.size >= 2
+        val members = if (isGroupMms) listOf(senderPhone) + others else listOf(senderPhone)
+
+        val conversation = if (isGroupMms) {
+            findGroupConversation(members) ?: createOrOpenConversation(
+                title = "Group with ${members.size + 1}",
+                phoneOrGroupPhones = members.joinToString(","),
+                isGroup = true
+            )
+        } else {
+            createOrOpenConversation(title = senderPhone, phoneOrGroupPhones = senderPhone, isGroup = false)
+        }
+
+        val preview = when {
+            mms.body.isNotBlank() -> mms.body
+            mms.attachments.isNotEmpty() -> "📎 ${mms.attachments.first().title}"
+            else -> "[MMS]"
+        }
+
+        val msg = RcsMessage(
+            conversationId = conversation.id,
+            senderId = "external-$senderPhone",
+            senderName = senderPhone,
+            senderPhone = senderPhone,
+            body = mms.body,
+            timestampMs = mms.timestampMs,
+            isOutgoing = false,
+            protocol = TransportProtocol.MMS,
+            deliveryStatus = if (mms.failed) DeliveryStatus.FAILED else DeliveryStatus.DELIVERED,
+            attachments = mms.attachments
+        )
+        appendMessageInternal(msg)
+        updateConversationPreview(conversation.id, preview, mms.timestampMs, clearUnread = false)
+        if (!mms.failed) {
+            withSystemStore { store ->
+                val uri = store.insertMms(
+                    SystemMessageStore.Box.INBOX, conversationPhones(conversation), senderPhone, mms.recipients, mms.body, mms.attachments,
+                    mms.timestampMs, read = false, subId = SubscriptionManager.INVALID_SUBSCRIPTION_ID
+                )
+                if (uri != null) setSystemUri(conversation.id, msg.id, uri)
+            }
+        }
+        _lastTransportEvent.value = if (mms.failed) mms.body else "Received MMS from $senderPhone"
+    }
+
+    /** Finds a group conversation whose members are exactly [phones], ignoring order and formatting. */
+    private fun findGroupConversation(phones: List<String>): RcsConversation? {
+        val ownNumber = _networkConfig.value.localPhoneNumber
+        fun key(list: List<String>) = list
+            .filterNot { ownNumber.isNotBlank() && PhoneNumbers.sameNumber(it, ownNumber) }
+            .map { it.filter { ch -> ch.isDigit() }.removePrefix("1").ifBlank { it.lowercase() } }
+            .toSet()
+        val wanted = key(phones)
+        return _conversations.value.firstOrNull { conv ->
+            conv.participants.size > 1 && key(conv.participants.map { it.phoneNumber }) == wanted
+        }
+    }
+
+    /** Updates a message's status when only its id is known (results arriving after a restart). */
+    fun updateMessageStatusById(messageId: String, status: DeliveryStatus, info: String?) {
+        val conversationId = _messagesByConversation.value.entries
+            .firstOrNull { (_, msgs) -> msgs.any { it.id == messageId } }?.key ?: return
+        updateMessageStatus(conversationId, messageId, status)
+        if (info != null) _lastTransportEvent.value = info
     }
 
     fun sendQuickReplyToPhone(phone: String, text: String) {
@@ -417,6 +632,9 @@ class RcsRepository(
             map + (conversationId to updated)
         }
         updatedMsg?.let { dbHelper?.saveMessage(it) }
+        if (updatedMsg?.isOutgoing == true) {
+            withSystemStore { syncStatusToSystemStore(it, conversationId, messageId) }
+        }
     }
 
     private fun appendMessageInternal(message: RcsMessage) {
@@ -459,5 +677,200 @@ class RcsRepository(
             compareByDescending<RcsConversation> { it.isPinned }
                 .thenByDescending { it.lastMessageTimestampMs }
         )
+    }
+
+    // ---- Android's shared SMS/MMS storage ----
+
+    private fun findMessage(conversationId: String, messageId: String): RcsMessage? =
+        _messagesByConversation.value[conversationId]?.firstOrNull { it.id == messageId }
+
+    private fun conversationPhones(conv: RcsConversation): List<String> {
+        val ownNumber = _networkConfig.value.localPhoneNumber
+        return conv.participants.map { it.phoneNumber }
+            .filterNot { ownNumber.isNotBlank() && PhoneNumbers.sameNumber(it, ownNumber) }
+            .ifEmpty { listOf(conv.subtitleOrPhone) }
+    }
+
+    /** Runs [block] on the store's own thread, but only while we're allowed to write to it. */
+    private fun withSystemStore(block: (SystemMessageStore) -> Unit) {
+        val store = systemStore ?: return
+        externalScope.launch(storeDispatcher) {
+            if (store.isWritable()) runCatching { block(store) }
+        }
+    }
+
+    private fun saveOutgoingToSystemStore(
+        conversationId: String,
+        messageId: String,
+        insert: (SystemMessageStore, RcsMessage) -> String?
+    ) {
+        withSystemStore { store ->
+            val msg = findMessage(conversationId, messageId) ?: return@withSystemStore
+            if (msg.systemUri != null) return@withSystemStore // a retry or fallback of a saved message
+            val uri = insert(store, msg) ?: return@withSystemStore
+            setSystemUri(conversationId, messageId, uri)
+            // The send result may already be in. Bring the stored copy up to date.
+            syncStatusToSystemStore(store, conversationId, messageId)
+        }
+    }
+
+    private fun setSystemUri(conversationId: String, messageId: String, uri: String) {
+        var updatedMsg: RcsMessage? = null
+        _messagesByConversation.update { map ->
+            val current = map[conversationId].orEmpty()
+            map + (conversationId to current.map { msg ->
+                if (msg.id == messageId) msg.copy(systemUri = uri).also { updatedMsg = it } else msg
+            })
+        }
+        updatedMsg?.let { dbHelper?.saveMessage(it) }
+    }
+
+    private fun syncStatusToSystemStore(store: SystemMessageStore, conversationId: String, messageId: String) {
+        val msg = findMessage(conversationId, messageId) ?: return
+        val uri = msg.systemUri ?: return
+        store.updateBox(uri, boxFor(msg.deliveryStatus), delivered = msg.deliveryStatus == DeliveryStatus.DELIVERED)
+    }
+
+    private fun boxFor(status: DeliveryStatus): SystemMessageStore.Box = when (status) {
+        DeliveryStatus.SENDING -> SystemMessageStore.Box.OUTBOX
+        DeliveryStatus.FAILED -> SystemMessageStore.Box.FAILED
+        else -> SystemMessageStore.Box.SENT
+    }
+
+    /**
+     * One time, once we're the default SMS app: copy messages that only exist in this app into
+     * the shared storage, then bring in everything already there (texts from Google Messages
+     * or whatever app was used before) as conversations.
+     */
+    fun importSystemHistoryIfNeeded() {
+        val store = systemStore ?: return
+        if (!importRunning.compareAndSet(false, true)) return
+        externalScope.launch(storeDispatcher) {
+            try {
+                if (!store.isWritable() || store.isImportDone()) return@launch
+                exportAppOnlyMessages(store)
+                val imported = mergeSystemHistory(store.loadHistory())
+                store.markImportDone()
+                if (imported > 0) _lastTransportEvent.value = "Imported $imported messages from your phone"
+            } catch (t: Throwable) {
+                _lastTransportEvent.value = "Couldn't import your existing messages: ${t.message}"
+            } finally {
+                importRunning.set(false)
+            }
+        }
+    }
+
+    private fun exportAppOnlyMessages(store: SystemMessageStore) {
+        val subId = SubscriptionManager.INVALID_SUBSCRIPTION_ID
+        for (conv in _conversations.value) {
+            val phones = conversationPhones(conv)
+            for (msg in _messagesByConversation.value[conv.id].orEmpty()) {
+                if (msg.systemUri != null || !wentOverCellular(msg)) continue
+                val isMms = msg.protocol == TransportProtocol.MMS || msg.attachments.isNotEmpty() || phones.size > 1
+                val box = if (msg.isOutgoing) boxFor(msg.deliveryStatus) else SystemMessageStore.Box.INBOX
+                val uri = if (isMms) {
+                    store.insertMms(
+                        box, phones, if (msg.isOutgoing) null else msg.senderPhone,
+                        if (msg.isOutgoing) phones else phones.filterNot { PhoneNumbers.sameNumber(it, msg.senderPhone) },
+                        msg.body, msg.attachments, msg.timestampMs, read = true, subId = subId
+                    )
+                } else {
+                    store.insertSms(
+                        box, if (msg.isOutgoing) phones.first() else msg.senderPhone,
+                        msg.body, msg.timestampMs, read = true, subId = subId
+                    )
+                }
+                if (uri != null) setSystemUri(conv.id, msg.id, uri)
+            }
+        }
+    }
+
+    private fun wentOverCellular(msg: RcsMessage): Boolean = when {
+        msg.protocol == TransportProtocol.SMS || msg.protocol == TransportProtocol.MMS -> true
+        msg.isOutgoing && msg.deliveryStatus == DeliveryStatus.SMS_FALLBACK_SENT -> true
+        else -> false
+    }
+
+    /** Adds history from the shared storage that we don't already have. Returns how many. */
+    internal fun mergeSystemHistory(threads: List<SystemThread>): Int {
+        val known = _messagesByConversation.value.values.flatten().mapNotNull { it.systemUri }.toHashSet()
+        val ownNumber = _networkConfig.value.localPhoneNumber
+        var total = 0
+
+        for (thread in threads) {
+            val fresh = thread.messages.filter { it.uri !in known }
+            if (fresh.isEmpty()) continue
+            val people = thread.addresses
+                .filterNot { ownNumber.isNotBlank() && PhoneNumbers.sameNumber(it, ownNumber) }
+                .ifEmpty { thread.addresses }
+            val conv = if (people.size > 1) {
+                findGroupConversation(people) ?: createOrOpenConversation(
+                    title = "Group with ${people.size + 1}",
+                    phoneOrGroupPhones = people.joinToString(","),
+                    isGroup = true
+                )
+            } else {
+                createOrOpenConversation(title = people.first(), phoneOrGroupPhones = people.first(), isGroup = false)
+            }
+
+            val newMessages = fresh.map { toRcsMessage(conv.id, it, people.first()) }
+            _messagesByConversation.update { map ->
+                map + (conv.id to (map[conv.id].orEmpty() + newMessages).sortedBy { it.timestampMs })
+            }
+            dbHelper?.saveAll(emptyList(), mapOf(conv.id to newMessages)) // one transaction, much faster
+
+            val last = _messagesByConversation.value[conv.id].orEmpty().lastOrNull()
+            val unread = fresh.count { it.box == SystemMessageStore.Box.INBOX && !it.read }
+            var updatedConv: RcsConversation? = null
+            _conversations.update { list ->
+                sortConversations(list.map { c ->
+                    if (c.id != conv.id || last == null) c
+                    else c.copy(
+                        lastMessagePreview = previewOf(last),
+                        lastMessageTimestampMs = last.timestampMs,
+                        unreadCount = c.unreadCount + unread
+                    ).also { updatedConv = it }
+                })
+            }
+            updatedConv?.let { dbHelper?.saveConversation(it) }
+            total += newMessages.size
+        }
+        return total
+    }
+
+    private fun toRcsMessage(conversationId: String, m: SystemMessage, fallbackSender: String): RcsMessage {
+        val incoming = m.box == SystemMessageStore.Box.INBOX
+        val sender = m.sender.ifBlank { fallbackSender }
+        return RcsMessage(
+            conversationId = conversationId,
+            senderId = if (incoming) "external-$sender" else "me",
+            senderName = if (incoming) sender else "You",
+            senderPhone = if (incoming) sender else _networkConfig.value.localPhoneNumber,
+            body = m.body,
+            timestampMs = m.dateMs,
+            isOutgoing = !incoming,
+            protocol = if (m.isMms) TransportProtocol.MMS else TransportProtocol.SMS,
+            deliveryStatus = when (m.box) {
+                SystemMessageStore.Box.INBOX -> DeliveryStatus.DELIVERED
+                SystemMessageStore.Box.SENT -> if (m.delivered) DeliveryStatus.DELIVERED else DeliveryStatus.SMS_FALLBACK_SENT
+                // Anything still queued from another app isn't going anywhere now
+                SystemMessageStore.Box.OUTBOX, SystemMessageStore.Box.FAILED -> DeliveryStatus.FAILED
+            },
+            attachments = m.attachments,
+            systemUri = m.uri
+        )
+    }
+
+    private fun previewOf(msg: RcsMessage): String = when {
+        msg.body.isNotBlank() -> msg.body
+        msg.attachments.isNotEmpty() -> "📎 ${msg.attachments.first().title}"
+        else -> "[MMS]"
+    }
+
+    companion object {
+        /** How long to wait for the phone's MMS service before calling a send failed. */
+        const val MMS_SEND_TIMEOUT_MS = 5 * 60 * 1000L
+        const val MMS_TIMEOUT_TEXT =
+            "MMS timed out. The phone never got through to the carrier. Check mobile data and the SIM's MMS settings (APN)."
     }
 }

@@ -88,12 +88,23 @@ class RcsViewModel(val repository: RcsRepository) : ViewModel() {
         _replyingToMessage.value = null
     }
 
-    /**
-     * Photos, voice notes, files and location all need MMS or RCS file transfer, and neither is
-     * built yet. The old versions of these sent made up placeholder files, so they're gone.
-     */
+    fun sendMediaAttachment(conversationId: String, uriString: String?, captionText: String = "") {
+        if (uriString.isNullOrBlank()) {
+            showToast("No attachment selected")
+            return
+        }
+        val replyTarget = _replyingToMessage.value
+        repository.sendMediaUriMessage(
+            conversationId = conversationId,
+            uriString = uriString,
+            captionText = captionText,
+            replyToMessage = replyTarget
+        )
+        _replyingToMessage.value = null
+    }
+
     fun attachmentsNotSupportedYet() {
-        showToast("Attachments need MMS or RCS file transfer, and neither is built yet")
+        showToast("Select a photo or file to send via MMS")
     }
 
     fun handleSuggestedChipClick(conversationId: String, chip: SuggestedChip) {

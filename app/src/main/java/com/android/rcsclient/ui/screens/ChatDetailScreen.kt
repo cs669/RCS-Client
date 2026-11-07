@@ -16,11 +16,15 @@ import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.safeDrawing
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.LazyColumn
@@ -131,8 +135,6 @@ fun ChatDetailScreen(
     ) { uri ->
         if (uri != null) {
             onSendHighResPhoto(uri.toString())
-        } else {
-            onSendHighResPhoto(null)
         }
     }
 
@@ -151,12 +153,13 @@ fun ChatDetailScreen(
     }
 
     Scaffold(
+        contentWindowInsets = WindowInsets.safeDrawing,
         topBar = {
             Surface(
                 tonalElevation = 2.dp,
                 shadowElevation = 2.dp
             ) {
-                Column {
+                Column(modifier = Modifier.statusBarsPadding()) {
                     Row(
                         modifier = Modifier
                             .fillMaxWidth()
@@ -219,6 +222,8 @@ fun ChatDetailScreen(
                                     "RCS UP 2.7 • MLS E2EE (Epoch #${conversation.mlsEpoch})"
                                 isRcsActive ->
                                     "RCS UP 2.7 • Online"
+                                conversation.preferredProtocol == TransportProtocol.MMS ->
+                                    "MMS • ${conversation.subtitleOrPhone}"
                                 else ->
                                     "SMS • ${conversation.subtitleOrPhone}"
                             }
@@ -284,7 +289,11 @@ fun ChatDetailScreen(
                                 )
                                 Spacer(modifier = Modifier.width(4.dp))
                                 Text(
-                                    text = if (isRcsActive) "RCS" else "SMS",
+                                    text = when {
+                                        isRcsActive -> "RCS"
+                                        conversation.preferredProtocol == TransportProtocol.MMS -> "MMS"
+                                        else -> "SMS"
+                                    },
                                     fontSize = 11.sp,
                                     fontWeight = FontWeight.ExtraBold,
                                     color = if (isRcsActive) MaterialTheme.colorScheme.primary else SmsSlate
@@ -520,13 +529,20 @@ fun ChatDetailScreen(
                         .padding(horizontal = 8.dp, vertical = 8.dp),
                     verticalAlignment = Alignment.CenterVertically
                 ) {
-                    // Attachments need MMS or RCS file transfer. Neither exists yet, so the button
-                    // explains that instead of opening a tray of placeholder attachments.
-                    IconButton(onClick = { onSendHighResPhoto(null) }) {
+                    // Launch Android Photo Picker to attach and send a real photo over MMS (or RCS)
+                    IconButton(
+                        onClick = {
+                            runCatching {
+                                photoPickerLauncher.launch(
+                                    PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly)
+                                )
+                            }
+                        }
+                    ) {
                         Icon(
                             imageVector = Icons.Default.AddCircle,
-                            contentDescription = "Add attachment",
-                            tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                            contentDescription = "Attach photo for MMS",
+                            tint = MaterialTheme.colorScheme.primary,
                             modifier = Modifier.size(28.dp)
                         )
                     }

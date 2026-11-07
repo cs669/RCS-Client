@@ -3,6 +3,7 @@ package com.android.rcsclient
 import android.app.Application
 import com.android.rcsclient.data.RcsDatabaseHelper
 import com.android.rcsclient.data.RcsRepository
+import com.android.rcsclient.telephony.AndroidSystemMessageStore
 import com.android.rcsclient.telephony.CarrierImsRcsManager
 
 class RcsApplication : Application() {
@@ -14,7 +15,8 @@ class RcsApplication : Application() {
         super.onCreate()
         repository = RcsRepository(
             dbHelper = RcsDatabaseHelper(this),
-            imsRcsManager = CarrierImsRcsManager(this)
+            imsRcsManager = CarrierImsRcsManager(this),
+            systemStore = AndroidSystemMessageStore(this)
         )
     }
 }

@@ -201,7 +201,9 @@ fun RcsMainAppContent(rcsViewModel: RcsViewModel) {
                     onSendMessage = { text ->
                         rcsViewModel.sendTextMessage(activeConversation.id, text)
                     },
-                    onSendHighResPhoto = { _ -> rcsViewModel.attachmentsNotSupportedYet() },
+                    onSendHighResPhoto = { uri ->
+                        rcsViewModel.sendMediaAttachment(activeConversation.id, uri)
+                    },
                     onSendVoiceNote = { rcsViewModel.attachmentsNotSupportedYet() },
                     onSendGeoLocation = { rcsViewModel.attachmentsNotSupportedYet() },
                     onSendDocument = { rcsViewModel.attachmentsNotSupportedYet() },
@@ -216,11 +218,17 @@ fun RcsMainAppContent(rcsViewModel: RcsViewModel) {
                     onSetReplyingTo = rcsViewModel::setReplyingToMessage,
                     onInspectMessageMls = rcsViewModel::setInspectedMessageForMls,
                     onOpenMlsSecurityDialog = {
-                        rcsViewModel.showToast("Not encrypted. SMS isn't end-to-end encrypted, and RCS isn't connected yet.")
+                        rcsViewModel.showToast("Not encrypted. SMS/MMS isn't end-to-end encrypted, and RCS isn't connected yet.")
                     },
                     onToggleProtocolMode = { nextProtocol ->
                         if (nextProtocol == TransportProtocol.RCS_UP_2_7 && !imsStatus.isImsRegistered) {
-                            rcsViewModel.showToast("RCS isn't connected yet, so this chat stays on SMS")
+                            val fallbackProto = if (activeConversation.preferredProtocol == TransportProtocol.MMS) {
+                                TransportProtocol.SMS
+                            } else {
+                                TransportProtocol.MMS
+                            }
+                            rcsViewModel.repository.setConversationPreferredProtocol(activeConversation.id, fallbackProto)
+                            rcsViewModel.showToast("Switched this chat to ${fallbackProto.shortBadge}")
                         } else {
                             rcsViewModel.repository.setConversationPreferredProtocol(activeConversation.id, nextProtocol)
                             rcsViewModel.showToast("Switched this chat to ${nextProtocol.shortBadge}")
